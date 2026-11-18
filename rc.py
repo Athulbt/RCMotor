@@ -1,150 +1,348 @@
-import cv2
-import RPi.GPIO as GPIO
+"""
+RC car controller for Raspberry Pi.
+
+Drives a DC motor (through an L298N/DROK-style H-bridge) and a steering servo
+from an Xbox controller, records camera frames and logs every control input
+to CSV so each session can be replayed or used as a training dataset.
+
+Run on the Pi:            python3 rc.py
+Without a camera:         python3 rc.py --no-camera
+With a live preview:      python3 rc.py --show
+On a PC (no Pi hardware): python3 rc.py --sim
+"""
+
+import argparse
+import csv
+import datetime
+import os
+import sys
 import time
-from approxeng.input.selectbinder import ControllerResource  from approximate engineering for xbox controller sync with RPi
-import datetime 
 
-#set up GPIO Pins
-GPIO.setmode(GPIO.BCM) 
-#Basic convenience
-GPIO.setwarnings(False)
+# ---------------------------------------------------------------------------
+# Configuration — change these to match your wiring and servo
+# ---------------------------------------------------------------------------
+SERVO_PIN = 17          # steering servo signal
+IN1_PIN = 24            # motor driver IN1
+IN2_PIN = 25            # motor driver IN2
+ENA_PIN = 23            # motor driver ENA (speed, driven with PWM)
 
-# Set up Servo
-control = 17 # Control pin for servo
-GPIO.setup(control, GPIO.OUT) # setup control pin as a output
-servo = GPIO.PWM(control, 50) # create PWM instance of servo that sends out signals at 50 hertz
-servo.start(0) # start servo motor
+SERVO_FREQ_HZ = 50
+MOTOR_PWM_FREQ_HZ = 1000
 
-#setup pin for DC motor
-in1 = 24 #define pin numbers for in1, in2, and enable for DROK motor controller
-in2 = 25
-enA = 23
-def setup():  #define setup function for motors and set all pins as output pins
-    GPIO.setup(in1, GPIO.OUT)
-    GPIO.setup(in2, GPIO.OUT)
-    GPIO.setup(enA, GPIO.OUT)
+# Servo duty cycles (%) measured on the original car
+SERVO_DUTY_RIGHT = 8.0
+SERVO_DUTY_CENTER = 9.0
+SERVO_DUTY_LEFT = 10.5
+SERVO_HOLD_SECONDS = 0.15   # pulse length before the signal is released (stops jitter)
+SERVO_MIN_CHANGE = 0.1      # ignore duty changes smaller than this
 
-# Set up variables that will be used later
-held = "NA"
-two = 0
+STEER_DEADZONE = 0.10       # joystick values inside this are "straight"
+TRIGGER_DEADZONE = 0.05
+CRUISE_SPEED = 1.0          # speed (0-1) used by the D-pad forward/backward
 
-# define dictionary for control logging 
-control_dict_ex ={
-    "time":0,
-    "left": 0,
-    "right": 0,
-    "straight":1,
-    "forward": 0,
-    "backward":0,
-    "stopped" : 1
-}
-df = [] # create a list with the first entry being the starting conditions in dictionary 
+LOG_INTERVAL_SECONDS = 1.0  # how often a row + image are saved
+LOOP_DELAY_SECONDS = 0.02   # main loop period (~50 Hz)
+DATA_DIR = os.path.join(os.path.expanduser("~"), "rc_data")
 
-ret, frame = cap.read() #read frame
-images_folder = "/home/pi/Desktop/pictures" #set picture directory
 
-# main code that handles xbox inputs, motor control, servo control, logging data
-def main():
-    global two
-    input_time = -1 # Used with to log data every second(see end of main())
+# ---------------------------------------------------------------------------
+# Pure helpers (no hardware, easy to test)
+# ---------------------------------------------------------------------------
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+def steering_duty(x, deadzone=STEER_DEADZONE):
+    """Map joystick x (-1 = full left, 1 = full right) to a servo duty cycle."""
+    x = clamp(x, -1.0, 1.0)
+    if abs(x) < deadzone:
+        return SERVO_DUTY_CENTER
+    # rescale so steering starts smoothly at the edge of the dead zone
+    amount = (abs(x) - deadzone) / (1.0 - deadzone)
+    if x > 0:
+        return SERVO_DUTY_CENTER + amount * (SERVO_DUTY_RIGHT - SERVO_DUTY_CENTER)
+    return SERVO_DUTY_CENTER + amount * (SERVO_DUTY_LEFT - SERVO_DUTY_CENTER)
+
+
+def steering_label(x, deadzone=STEER_DEADZONE):
+    if x >= deadzone:
+        return "right"
+    if x <= -deadzone:
+        return "left"
+    return "straight"
+
+
+def throttle_from_inputs(forward_trigger, reverse_trigger, cruise):
+    """
+    Combine triggers and D-pad cruise into one throttle value in [-1, 1].
+    Triggers override cruise while held; positive = forward.
+    """
+    forward_trigger = clamp(forward_trigger, 0.0, 1.0)
+    reverse_trigger = clamp(reverse_trigger, 0.0, 1.0)
+    if forward_trigger > TRIGGER_DEADZONE or reverse_trigger > TRIGGER_DEADZONE:
+        return forward_trigger - reverse_trigger
+    return clamp(cruise, -1.0, 1.0)
+
+
+def direction_label(throttle):
+    if throttle > 0:
+        return "forward"
+    if throttle < 0:
+        return "backward"
+    return "stopped"
+
+
+# ---------------------------------------------------------------------------
+# Hardware
+# ---------------------------------------------------------------------------
+class FakeGPIO:
+    """Stand-in for RPi.GPIO so the script can run on a normal computer."""
+
+    BCM = OUT = "x"
+    LOW, HIGH = 0, 1
+
+    class _PWM:
+        def __init__(self, pin, freq):
+            self.pin = pin
+
+        def start(self, duty):
+            pass
+
+        def ChangeDutyCycle(self, duty):
+            pass
+
+        def stop(self):
+            pass
+
+    def setmode(self, mode):
+        pass
+
+    def setwarnings(self, flag):
+        pass
+
+    def setup(self, pin, mode):
+        pass
+
+    def output(self, pin, value):
+        pass
+
+    def PWM(self, pin, freq):
+        return self._PWM(pin, freq)
+
+    def cleanup(self):
+        print("[sim] GPIO cleaned up")
+
+
+def load_gpio(simulate):
+    if simulate:
+        return FakeGPIO()
     try:
-        with ControllerResource() as joystick: # When xbox is connected, create a instance of the xbox with alias 'joystick'
-            print("Connected")
-            while joystick.connected:  # run while xbox is connected to RPi
-                control_dict = { # dictionary for logging data after initial set up
-                    "time":0,
-                    "left": 0,
-                    "right": 0,
-                    "straight":1,
-                    "forward": 0,
-                    "backward":0,
-                    "stopped" : 1
-                }
-                servo.ChangeDutyCycle(0) 
-                time.sleep(0.05)  # try to stabalize servo wheel jitter
-                
-                x, y = joystick['l'] # get x and y coordinates from left joystick on xbox
-                held = joystick.check_presses() # check for xbox controller presses 
-                x = x * 100. # augment data since x coordinates are very small
-                
-                if held['cross']: # 'cross' = 'a' on xbox, if a pressed, cleanup motors, print the dictionary df with logged data, change state to 0, and exit thread
-                    GPIO.cleanup()
-                    df.pop(0)
-                    df.pop(0)
-                    print(df)
-                    state = 0 # stop running camera
-                    return df
+        import RPi.GPIO as GPIO
+        return GPIO
+    except (ImportError, RuntimeError):
+        print("RPi.GPIO not available - run with --sim to test without a Pi.")
+        sys.exit(1)
 
-                if held['dup']: # 'dup' = d-pad up on xbox, 
-                    setup()
-                    GPIO.output(in1, GPIO.LOW) #LOW, HIGH, HIGH turns motor
-                    GPIO.output(in2, GPIO.HIGH)
-                    GPIO.output(enA, GPIO.HIGH)
-                    control_dict["backward"] = 0 # change dictionary values respectively 
-                    control_dict["stopped"] = 0
-                    control_dict["forward"] = 1
-                if held['ddown']:
-                    setup()
-                    GPIO.output(in1, GPIO.HIGH) # HIGH, LOW, HIGH turns motor
-                    GPIO.output(in2, GPIO.LOW)
-                    GPIO.output(enA, GPIO.HIGH)
-                    control_dict["backward"] = 1 # change dictionary values respectively
-                    control_dict["stopped"] = 0
-                    control_dict["forward"] = 0
-                if held == "NA" or held["l1"]: # run this block when xbox first connects or 'l1' (aka Y on xbox) is pressed
-                    setup()
-                    GPIO.output(in1, GPIO.LOW) #LOW, LOW, LOW turns both outputs low and turns motor off
-                    GPIO.output(in2, GPIO.LOW)
-                    GPIO.output(enA, GPIO.LOW)
-                    control_dict["backward"] = 0 # change dictionary values respectively
-                    control_dict["stopped"] = 1
-                    control_dict["forward"] = 0
-              
-                if x > 10:  # If joystick is right, turn servo right
-                    servo.ChangeDutyCycle(8) #This value causes wheel to turn right
-                    time.sleep(0.09)
-                    servo.ChangeDutyCycle(0)
-                    control_dict["right"] = 1 # change dictionary values respectively
-                    control_dict["left"] = 0
-                    control_dict["straight"] = 0
-                if x < -10: #If joystick is left, turn servo left
-                    servo.ChangeDutyCycle(10.5) #This values causes wheel to turn left
-                    time.sleep(0.09)
-                    servo.ChangeDutyCycle(0)
-                    control_dict["right"] = 0 # change dictionary values respectively
-                    control_dict["left"] = 1
-                    control_dict["straight"] = 0
-                if x > -10 and x < 10: #If joystick is not moving within a certain margin, turn wheels straight
-                    servo.ChangeDutyCycle(9) #This values makes wheels straight
-                    time.sleep(0.09)
-                    servo.ChangeDutyCycle(0) 
-                    control_dict["right"] = 0 # change dictionary values respectively
-                    control_dict["left"] = 0
-                    control_dict["straight"] = 1
-                held = "" # clear the previous entry from keyboard to not get stuck
-                ret, frame = cap.read()
-                cv2.imshow('img', frame)
-                cv2.waitKey(1)
-                if input_time < time.localtime(time.time()).tm_sec: #ad hoc method to log data every second
-                    control_dict["time"] = [time.localtime(time.time()).tm_mon, time.localtime(time.time()).tm_mday, time.localtime(time.time()).tm_year, time.localtime(time.time()).tm_hour, time.localtime(time.time()).tm_min, time.localtime(time.time()).tm_sec] #insert time into data frame
-                    df.append(control_dict) # add the control_dict dictionary with user inputs into df list
-                    print(control_dict)
-                    input_time = time.localtime(time.time()).tm_sec #change input time to make it current time, which will be less than the time in the next second, causing this if statment to run again
-                    if input_time == 59: #If time reaches 59, reset input_time to make it keep running
-                        input_time = 0
-                    img_time = datetime.datetime.fromtimestamp(time.time()).strftime('%H-%M-%S')
-                    frameId = cap.get(1)
-                    filename = images_folder + "/image_" + str(int(frameId)) + "_" + str(img_time) + ".jpg"
-                    if two <= 2:
-                        two += 1
-                        continue
-                    cv2.imwrite(filename, frame)
-                    
-                
-        #Disconnected
-        print("Joystick disconnected") # When xbox disconnects, print this
-    except IOError: #Run when xbox does not connect
-        state = 0 # Keep state 0 to make the video part not run since xbox never connected
-        print("No joystick found")
-        exit()
-main()
+
+class Car:
+    def __init__(self, gpio):
+        self.gpio = gpio
+        gpio.setmode(gpio.BCM)
+        gpio.setwarnings(False)
+        for pin in (IN1_PIN, IN2_PIN, ENA_PIN, SERVO_PIN):
+            gpio.setup(pin, gpio.OUT)
+
+        self.motor_pwm = gpio.PWM(ENA_PIN, MOTOR_PWM_FREQ_HZ)
+        self.motor_pwm.start(0)
+        self.servo = gpio.PWM(SERVO_PIN, SERVO_FREQ_HZ)
+        self.servo.start(0)
+
+        self.throttle = 0.0
+        self.servo_duty = None
+        self.servo_release_at = 0.0
+        self.stop()
+        self.steer_duty(SERVO_DUTY_CENTER)
+
+    def drive(self, throttle):
+        """throttle in [-1, 1]; sign = direction, magnitude = speed."""
+        throttle = clamp(throttle, -1.0, 1.0)
+        g = self.gpio
+        if throttle > 0:
+            g.output(IN1_PIN, g.LOW)
+            g.output(IN2_PIN, g.HIGH)
+        elif throttle < 0:
+            g.output(IN1_PIN, g.HIGH)
+            g.output(IN2_PIN, g.LOW)
+        else:
+            g.output(IN1_PIN, g.LOW)
+            g.output(IN2_PIN, g.LOW)
+        self.motor_pwm.ChangeDutyCycle(abs(throttle) * 100)
+        self.throttle = throttle
+
+    def stop(self):
+        self.drive(0)
+
+    def steer_duty(self, duty):
+        """Move the servo only when the target changes, then release the signal."""
+        now = time.monotonic()
+        if self.servo_duty is None or abs(duty - self.servo_duty) >= SERVO_MIN_CHANGE:
+            self.servo.ChangeDutyCycle(duty)
+            self.servo_duty = duty
+            self.servo_release_at = now + SERVO_HOLD_SECONDS
+        elif self.servo_release_at and now >= self.servo_release_at:
+            self.servo.ChangeDutyCycle(0)
+            self.servo_release_at = 0.0
+
+    def cleanup(self):
+        try:
+            self.stop()
+            self.motor_pwm.stop()
+            self.servo.stop()
+        finally:
+            self.gpio.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# Camera and logging
+# ---------------------------------------------------------------------------
+class Camera:
+    def __init__(self, index, show):
+        import cv2
+        self.cv2 = cv2
+        self.show = show
+        self.cap = cv2.VideoCapture(index)
+        if not self.cap.isOpened():
+            raise RuntimeError("Could not open camera %d" % index)
+
+    def read(self):
+        ok, frame = self.cap.read()
+        if not ok:
+            return None
+        if self.show:
+            self.cv2.imshow("RC camera", frame)
+            self.cv2.waitKey(1)
+        return frame
+
+    def save(self, frame, path):
+        return self.cv2.imwrite(path, frame)
+
+    def close(self):
+        self.cap.release()
+        if self.show:
+            self.cv2.destroyAllWindows()
+
+
+class SessionLog:
+    FIELDS = ["timestamp", "steer_x", "steering", "throttle", "direction", "image"]
+
+    def __init__(self, root):
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.folder = os.path.join(root, "session_" + stamp)
+        self.image_folder = os.path.join(self.folder, "images")
+        os.makedirs(self.image_folder, exist_ok=True)
+        self.file = open(os.path.join(self.folder, "controls.csv"), "w", newline="")
+        self.writer = csv.DictWriter(self.file, fieldnames=self.FIELDS)
+        self.writer.writeheader()
+        self.rows = 0
+
+    def write(self, steer_x, throttle, image_name=""):
+        self.writer.writerow({
+            "timestamp": datetime.datetime.now().isoformat(timespec="milliseconds"),
+            "steer_x": round(steer_x, 3),
+            "steering": steering_label(steer_x),
+            "throttle": round(throttle, 3),
+            "direction": direction_label(throttle),
+            "image": image_name,
+        })
+        self.file.flush()
+        self.rows += 1
+
+    def close(self):
+        self.file.close()
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+def run(args):
+    from approxeng.input.selectbinder import ControllerResource
+
+    car = Car(load_gpio(args.sim))
+    camera = None
+    log = None
+    try:
+        if not args.no_camera:
+            try:
+                camera = Camera(args.camera, args.show)
+            except Exception as error:
+                print("Camera disabled:", error)
+
+        log = SessionLog(args.data_dir)
+        print("Logging to", log.folder)
+
+        cruise = 0.0
+        next_log = time.monotonic()
+
+        print("Waiting for controller...")
+        with ControllerResource() as joystick:
+            print("Controller connected")
+            while joystick.connected:
+                presses = joystick.check_presses()
+
+                if presses["cross"]:            # A: quit
+                    print("Quit pressed")
+                    break
+                if presses["dup"]:              # D-pad up: cruise forward
+                    cruise = CRUISE_SPEED
+                if presses["ddown"]:            # D-pad down: cruise backward
+                    cruise = -CRUISE_SPEED
+                if presses["triangle"] or presses["l1"]:   # Y or LB: stop
+                    cruise = 0.0
+
+                steer_x = joystick["lx"]
+                throttle = throttle_from_inputs(joystick["rt"], joystick["lt"], cruise)
+
+                car.drive(throttle)
+                car.steer_duty(steering_duty(steer_x))
+
+                frame = camera.read() if camera else None
+
+                now = time.monotonic()
+                if now >= next_log:
+                    next_log = now + LOG_INTERVAL_SECONDS
+                    image_name = ""
+                    if frame is not None:
+                        image_name = "img_%05d.jpg" % log.rows
+                        if not camera.save(frame, os.path.join(log.image_folder, image_name)):
+                            image_name = ""
+                    log.write(steer_x, throttle, image_name)
+
+                time.sleep(LOOP_DELAY_SECONDS)
+            else:
+                print("Controller disconnected")
+    except IOError:
+        print("No controller found - pair the Xbox controller and try again.")
+    except KeyboardInterrupt:
+        print("Stopped with Ctrl+C")
+    finally:
+        # always stop the motor, even after a crash or disconnect
+        car.cleanup()
+        if camera:
+            camera.close()
+        if log:
+            log.close()
+            print("Saved %d log rows to %s" % (log.rows, log.folder))
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Raspberry Pi RC car controller")
+    parser.add_argument("--no-camera", action="store_true", help="run without a camera")
+    parser.add_argument("--camera", type=int, default=0, help="camera index (default 0)")
+    parser.add_argument("--show", action="store_true", help="show a live camera preview window")
+    parser.add_argument("--sim", action="store_true", help="fake the GPIO pins (run on a PC)")
+    parser.add_argument("--data-dir", default=DATA_DIR, help="where sessions are saved")
+    return parser.parse_args(argv)
+
+
+if __name__ == "__main__":
+    run(parse_args())
