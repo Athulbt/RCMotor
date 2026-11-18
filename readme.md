@@ -8,7 +8,7 @@ A Raspberry Pi RC car controlled with an Xbox controller. It drives a DC motor a
 - **Variable speed:** the triggers control speed with PWM, and the D-pad sets a fixed cruise speed.
 - **Safe shutdown:** the motor always stops on quit, on a crash, on Ctrl+C or if the controller disconnects.
 - **Session logs:** each drive is saved in its own folder, with a `controls.csv` and matching camera images.
-- **Simulation mode:** `--sim` runs the script on a normal PC without GPIO hardware.
+- **PC test mode:** `--pc` runs the whole thing on Windows, macOS or Linux. It uses your Xbox controller or the keyboard, shows a live dashboard and fakes the GPIO pins.
 
 ## Hardware
 
@@ -41,8 +41,25 @@ pip3 install -r requirements.txt
 python3 rc.py              # normal run
 python3 rc.py --show       # with a live camera preview (needs a display)
 python3 rc.py --no-camera  # without a camera
-python3 rc.py --sim        # on a PC, with GPIO faked
+python3 rc.py --pc --show  # on a PC (see below)
 ```
+
+## Test on a PC (no Pi needed)
+
+```bash
+pip install -r requirements-pc.txt
+python rc.py --pc --show
+```
+
+A dashboard window shows the live steering and throttle, and `--show` opens the webcam preview. Sessions are logged exactly like on the car. With no controller plugged in, use the keyboard (click the dashboard window first):
+
+| Key        | Action                     |
+|------------|----------------------------|
+| ← / →      | Steer                      |
+| ↑ / ↓      | Hold to drive forward / backward |
+| W / S      | Cruise forward / backward  |
+| Space      | Stop                       |
+| Esc        | Quit                       |
 
 Other options: `--camera N` picks a different camera, and `--data-dir PATH` changes where sessions are saved (default `~/rc_data`).
 

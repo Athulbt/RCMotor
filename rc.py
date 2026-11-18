@@ -8,7 +8,7 @@ to CSV so each session can be replayed or used as a training dataset.
 Run on the Pi:            python3 rc.py
 Without a camera:         python3 rc.py --no-camera
 With a live preview:      python3 rc.py --show
-On a PC (no Pi hardware): python3 rc.py --sim
+On a PC (no Pi hardware): python3 rc.py --pc
 """
 
 import argparse
@@ -264,8 +264,18 @@ class SessionLog:
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
-def run(args):
+def open_controller(pc_mode):
+    """Xbox controller via approxeng on the Pi, or pygame in PC test mode."""
+    if pc_mode:
+        from pc_controller import PygameController
+        return PygameController()
     from approxeng.input.selectbinder import ControllerResource
+    return ControllerResource()
+
+
+def run(args):
+    if args.pc:
+        args.sim = True   # no GPIO pins on a PC
 
     car = Car(load_gpio(args.sim))
     camera = None
@@ -284,8 +294,8 @@ def run(args):
         next_log = time.monotonic()
 
         print("Waiting for controller...")
-        with ControllerResource() as joystick:
-            print("Controller connected")
+        with open_controller(args.pc) as joystick:
+            print("Ready - drive!")
             while joystick.connected:
                 presses = joystick.check_presses()
 
@@ -317,6 +327,10 @@ def run(args):
                             image_name = ""
                     log.write(steer_x, throttle, image_name)
 
+                if hasattr(joystick, "draw"):   # PC test mode dashboard
+                    joystick.draw(steer_x, throttle, steering_label(steer_x),
+                                  direction_label(throttle), log.rows)
+
                 time.sleep(LOOP_DELAY_SECONDS)
             else:
                 print("Controller disconnected")
@@ -340,6 +354,8 @@ def parse_args(argv=None):
     parser.add_argument("--camera", type=int, default=0, help="camera index (default 0)")
     parser.add_argument("--show", action="store_true", help="show a live camera preview window")
     parser.add_argument("--sim", action="store_true", help="fake the GPIO pins (run on a PC)")
+    parser.add_argument("--pc", action="store_true",
+                        help="PC test mode: pygame controller/keyboard + dashboard, GPIO faked")
     parser.add_argument("--data-dir", default=DATA_DIR, help="where sessions are saved")
     return parser.parse_args(argv)
 
